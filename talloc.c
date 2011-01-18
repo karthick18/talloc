@@ -51,17 +51,18 @@
 
 
 #define MAX_TALLOC_SIZE 0x10000000
-#define TALLOC_MAGIC_BASE 0xe814ec70
+#define TALLOC_MAGIC_BASE 0xe814ec60
 #define TALLOC_MAGIC ( \
 	TALLOC_MAGIC_BASE + \
-	(TALLOC_VERSION_MAJOR << 12) + \
-	(TALLOC_VERSION_MINOR << 4) \
+	(TALLOC_VERSION_MAJOR << 11) + \
+	(TALLOC_VERSION_MINOR << 5) \
 )
 
 #define TALLOC_FLAG_FREE 0x01
 #define TALLOC_FLAG_LOOP 0x02
 #define TALLOC_FLAG_POOL 0x04		/* This is a talloc pool */
 #define TALLOC_FLAG_POOLMEM 0x08	/* This is allocated in a pool */
+#define TALLOC_FLAG_POOLCACHE 0x10 /* This is allocated from a static pool/cache */
 #define TALLOC_MAGIC_REFERENCE ((const char *)1)
 
 /* by default we abort when given a bad pointer (such as when talloc_free() is called 
@@ -205,8 +206,8 @@ static void talloc_abort(const char *reason)
 static void talloc_abort_magic(unsigned magic)
 {
 	unsigned striped = magic - TALLOC_MAGIC_BASE;
-	unsigned major = (striped & 0xFFFFF000) >> 12;
-	unsigned minor = (striped & 0x00000FF0) >> 4;
+	unsigned major = (striped & 0xFFFFF800) >> 11;
+	unsigned minor = (striped & 0x000007E0) >> 4;
 	talloc_log("Bad talloc magic[0x%08X/%u/%u] expected[0x%08X/%u/%u]\n",
 		   magic, major, minor,
 		   TALLOC_MAGIC, TALLOC_VERSION_MAJOR, TALLOC_VERSION_MINOR);
@@ -228,9 +229,9 @@ static inline struct talloc_chunk *talloc_chunk_from_ptr(const void *ptr)
 {
 	const char *pp = (const char *)ptr;
 	struct talloc_chunk *tc = discard_const_p(struct talloc_chunk, pp - TC_HDR_SIZE);
-	if (unlikely((tc->flags & (TALLOC_FLAG_FREE | ~0xF)) != TALLOC_MAGIC)) { 
-		if ((tc->flags & (~0xFFF)) == TALLOC_MAGIC_BASE) {
-			talloc_abort_magic(tc->flags & (~0xF));
+	if (unlikely((tc->flags & (TALLOC_FLAG_FREE | ~0x1F)) != TALLOC_MAGIC)) { 
+		if ((tc->flags & (~0x7FF)) == TALLOC_MAGIC_BASE) {
+			talloc_abort_magic(tc->flags & (~0x1F));
 			return NULL;
 		}
 
@@ -320,10 +321,75 @@ const char *talloc_parent_name(const void *ptr)
 */
 
 #define TALLOC_POOL_HDR_SIZE 16
+#define TALLOC_POOL_MAP_BITS(sz) ( ((sz) + 7) & ~7 )
+#define TALLOC_POOL_MAP_BYTES(sz) ( TALLOC_POOL_MAP_BITS(sz) >> 3 )
+#define TALLOC_POOL_MAP_WORDS(sz) ( ( (TALLOC_POOL_MAP_BYTES(sz) + 3) & ~3) >> 2 )
+#define TALLOC_POOL_SPACE(sz) (TALLOC_POOL_MAP_WORDS(sz) << 2)
+#define TALLOC_POOL_HDR_SPACE(sz)    ( (((2+TALLOC_POOL_MAP_WORDS(sz)) << 2) + TALLOC_POOL_HDR_SIZE-1) & ~(TALLOC_POOL_HDR_SIZE-1))
+#define TALLOC_POOL_MAP(tc) ( (unsigned int *) ( (char*)tc + sizeof(struct talloc_chunk) + 2*sizeof(unsigned int) ) )
+
+static unsigned int *talloc_cache_objectcount(struct talloc_chunk *tc)
+{
+    return (unsigned int *) ( (char*)tc + sizeof(struct talloc_chunk) + sizeof(unsigned int) );
+}
 
 static unsigned int *talloc_pool_objectcount(struct talloc_chunk *tc)
 {
 	return (unsigned int *)((char *)tc + sizeof(struct talloc_chunk));
+}
+
+static inline void talloc_pool_map_reset(struct talloc_chunk *tc)
+{
+    unsigned int *map = TALLOC_POOL_MAP(tc);
+    unsigned int map_words = TALLOC_POOL_MAP_WORDS(*talloc_cache_objectcount(tc));
+    memset(map, 0, map_words * sizeof(map_words));
+}
+
+/*
+ * Less expensive space wise than a LIFO free with a array linked list.
+ */
+static inline int talloc_pool_map_clear(struct talloc_chunk *tc, unsigned int bit)
+{
+    unsigned int *map;
+    if(unlikely(bit >= *talloc_cache_objectcount(tc)))
+        return -1;
+    map = TALLOC_POOL_MAP(tc);
+    map[bit >> 5] &= ~(1 << (bit & 31));
+    return 0;
+}
+
+static inline int talloc_pool_map_get(struct talloc_chunk *tc)
+{
+    unsigned int *map = TALLOC_POOL_MAP(tc);
+    unsigned int count = *talloc_cache_objectcount(tc);
+    unsigned int map_words = TALLOC_POOL_MAP_WORDS(count);
+    static int ffz_map[16] = { 0, 1, 0, 2, 0, 1, 0, 3, 0, 1, 0, 2, 0, 1, 0, -1 };
+    int i;
+    for(i = 0; i < map_words; ++i) {
+        unsigned int offset = 0;
+        unsigned int mask = map[i] & 0xffffffffU;
+        if(mask == 0xffffffffU) continue;
+        if ( (mask & 0xffff) == 0xffff ) {
+            offset += 16;
+            mask >>= 16;
+        }
+        if ( (mask & 0xff) == 0xff ) {
+            offset += 8;
+            mask >>= 8;
+        } 
+        if ( (mask & 0xf) == 0xf ) {
+            offset += 4;
+            mask >>= 4;
+        }
+        offset += ffz_map[mask & 0xf];
+        map[i] |= (1 << offset);
+        i = (i<<5) + offset;
+        if(unlikely(i >= count)) {
+            return -1;
+        }
+        return i;
+    }
+    return -1;
 }
 
 /*
@@ -331,11 +397,11 @@ static unsigned int *talloc_pool_objectcount(struct talloc_chunk *tc)
 */
 
 static struct talloc_chunk *talloc_alloc_pool(struct talloc_chunk *parent,
-					      size_t size)
+                                              size_t size)
 {
 	struct talloc_chunk *pool_ctx = NULL;
 	size_t space_left;
-	struct talloc_chunk *result;
+	struct talloc_chunk *result = NULL;
 	size_t chunk_size;
 
 	if (parent == NULL) {
@@ -352,6 +418,29 @@ static struct talloc_chunk *talloc_alloc_pool(struct talloc_chunk *parent,
 	if (pool_ctx == NULL) {
 		return NULL;
 	}
+
+    /*
+     * Check if the chunk was to be allocated from a static pool. and see if we 
+     * have the required capacity and space for it.
+     */
+    if( (pool_ctx->flags & TALLOC_FLAG_POOLCACHE) )
+    {
+        /*
+         * We are in the right context.
+         */
+        unsigned int count = *talloc_cache_objectcount(pool_ctx);
+        if(*talloc_pool_objectcount(pool_ctx) > count) /* +1 for the pool itself */
+            return NULL;
+        if( (TALLOC_POOL_HDR_SPACE(count) + size*count)  == pool_ctx->size)
+        {
+            int idx = talloc_pool_map_get(pool_ctx);
+            if(idx < 0)
+                return NULL;
+            result = (struct talloc_chunk*) ((char*)pool_ctx->pool + idx*size);
+            goto set_poolmem;
+        }
+        return NULL;
+    }
 
 	space_left = ((char *)pool_ctx + TC_HDR_SIZE + pool_ctx->size)
 		- ((char *)pool_ctx->pool);
@@ -373,12 +462,33 @@ static struct talloc_chunk *talloc_alloc_pool(struct talloc_chunk *parent,
 
 	pool_ctx->pool = (void *)((char *)result + chunk_size);
 
+    set_poolmem:
 	result->flags = TALLOC_MAGIC | TALLOC_FLAG_POOLMEM;
 	result->pool = pool_ctx;
 
 	*talloc_pool_objectcount(pool_ctx) += 1;
 
 	return result;
+}
+
+static inline void __talloc_link(const void *context, struct talloc_chunk *tc)
+{
+    if (likely(context)) {
+        struct talloc_chunk *parent = talloc_chunk_from_ptr(context);
+
+        if (parent->child) {
+            parent->child->parent = NULL;
+            tc->next = parent->child;
+            tc->next->prev = tc;
+        } else {
+            tc->next = NULL;
+        }
+        tc->parent = parent;
+        tc->prev = NULL;
+        parent->child = tc;
+    } else {
+        tc->next = tc->prev = tc->parent = NULL;
+    }
 }
 
 /* 
@@ -413,25 +523,59 @@ static inline void *__talloc(const void *context, size_t size)
 	tc->child = NULL;
 	tc->name = NULL;
 	tc->refs = NULL;
+    __talloc_link(context, tc);
+    
+	return TC_PTR_FROM_CHUNK(tc);
+}
 
-	if (likely(context)) {
-		struct talloc_chunk *parent = talloc_chunk_from_ptr(context);
+static void *_talloc_cache(const void *context, bool zero)
+{
+    struct talloc_chunk *tc;
+    struct talloc_chunk *parent;
+    void *result;
+    unsigned int count;
+    size_t size;
+    size_t objsize;
 
-		if (parent->child) {
-			parent->child->parent = NULL;
-			tc->next = parent->child;
-			tc->next->prev = tc;
-		} else {
-			tc->next = NULL;
-		}
-		tc->parent = parent;
-		tc->prev = NULL;
-		parent->child = tc;
-	} else {
-		tc->next = tc->prev = tc->parent = NULL;
+    if (unlikely(context == NULL) ) {
+        return NULL;
+    }
+
+    parent = talloc_chunk_from_ptr(context);
+    if( unlikely(!(parent->flags & TALLOC_FLAG_POOLCACHE)) ) {
+        return NULL;
+    }
+    
+    count = *talloc_cache_objectcount(parent);
+    size = parent->size - TALLOC_POOL_HDR_SPACE(count);
+    objsize = size / count;
+
+    tc = talloc_alloc_pool(parent, objsize); /* already includes header size*/
+
+    if (tc == NULL) {
+        return NULL;
 	}
 
-	return TC_PTR_FROM_CHUNK(tc);
+    tc->size = objsize;
+    tc->destructor = NULL;
+    tc->child = NULL;
+    tc->name = NULL;
+	tc->refs = NULL;
+    __talloc_link(context, tc);
+    result = TC_PTR_FROM_CHUNK(tc);
+    if(zero)
+        memset(result, 0, objsize - TC_HDR_SIZE);
+    return result;
+}
+
+void *talloc_cache(const void *context)
+{
+    return _talloc_cache(context, false);
+}
+
+void *talloc_cache_zero(const void *context)
+{
+    return _talloc_cache(context, true);
 }
 
 /*
@@ -459,6 +603,57 @@ void *talloc_pool(const void *context, size_t size)
 #endif
 
 	return result;
+}
+
+void *talloc_pool_cache(const void *context, size_t size, size_t objsize)
+{
+    void *result;
+    struct talloc_chunk *tc;
+    unsigned int count;
+    unsigned int hdrsize;
+
+    if (unlikely(size <= 0) || unlikely(objsize <= 0) ) {
+        return NULL;
+    }
+
+    if ( unlikely(objsize > size) ) {
+        return NULL;
+    }
+    
+    /*
+     * Wish we could restrict this to power of 2 but not required 
+     * to impose restrictions.
+     * Align to objsize.
+     */
+    size += objsize - 1;
+    size = size/objsize * objsize;
+
+    count = size/objsize; /* target */
+    /*
+     * Align size to objsize and also add the header per object.
+     */
+    objsize += TC_HDR_SIZE;
+    objsize = (objsize + 15) & ~15;
+    size = objsize * count;
+    hdrsize = TALLOC_POOL_HDR_SPACE(count);
+    result = __talloc(context, size + hdrsize);
+    if (unlikely(result == NULL)) {
+        return NULL;
+    }
+
+    tc = talloc_chunk_from_ptr(result);
+
+    tc->flags |= TALLOC_FLAG_POOL | TALLOC_FLAG_POOLCACHE;
+    tc->pool = (char *)result + hdrsize;
+    *talloc_cache_objectcount(tc) = count;
+    *talloc_pool_objectcount(tc) = 1;
+    talloc_pool_map_reset(tc);
+
+#if defined(DEVELOPER) && defined(VALGRIND_MAKE_MEM_NOACCESS)
+    VALGRIND_MAKE_MEM_NOACCESS(tc->pool, size);
+#endif
+
+    return result;
 }
 
 /*
@@ -555,6 +750,78 @@ void *_talloc_reference_loc(const void *context, const void *ptr, const char *lo
 }
 
 static void *_talloc_steal_internal(const void *new_ctx, const void *ptr);
+static int _talloc_pool_release(struct talloc_chunk *pool, struct talloc_chunk *tc, 
+                                struct talloc_chunk *parent);
+
+static int _talloc_cache_release(struct talloc_chunk *pool, struct talloc_chunk *tc, 
+                                 struct talloc_chunk *parent)
+{
+    int res = 0;
+    if( (pool->flags & TALLOC_FLAG_POOLCACHE) ) {
+        unsigned int *pool_object_count = talloc_pool_objectcount(pool);
+        if( ( tc->flags & TALLOC_FLAG_POOLMEM) ) {
+            unsigned int count = *talloc_cache_objectcount(pool);
+            size_t size = pool->size - TALLOC_POOL_HDR_SPACE(count);
+            size_t objsize = size / count;
+            unsigned int idx = ( (char*)tc - (char*)pool->pool ) / objsize;
+            res = talloc_pool_map_clear(pool, idx);
+            if(res < 0)
+                return -1;
+        }
+        *pool_object_count -= 1;
+        if(*pool_object_count == 0) {
+            /*
+             * Check for nested pools/caches. 
+             * For caches, the extra TC_HDR should indirectly ensure that it isn't hit.
+             */
+            if( ( tc->flags & TALLOC_FLAG_POOLMEM ) ) {
+                /*
+                 * Paranoia
+                 */
+                if(unlikely(parent == NULL)) {
+                    return -1;
+                }
+                return _talloc_pool_release(parent, tc, NULL);
+            } else { 
+                free(tc);
+            }
+        }
+    } 
+    return res;
+}
+
+static int _talloc_pool_release(struct talloc_chunk *pool, struct talloc_chunk *tc, 
+                                struct talloc_chunk *parent)
+{
+    if ( (tc->flags & (TALLOC_FLAG_POOL | TALLOC_FLAG_POOLMEM) ) ) {
+        unsigned int *pool_object_count = talloc_pool_objectcount(pool);
+        if ( *pool_object_count == 0 ) {
+            talloc_abort("Pool object count zero!");
+            return 0;
+        }
+        if ( ( pool->flags & TALLOC_FLAG_POOLCACHE ) ) {
+            return _talloc_cache_release(pool, tc, parent);
+        }
+        *pool_object_count -= 1;
+        if (*pool_object_count == 0) { 
+            /*
+             * Nested pools.
+             */
+            if ( (tc->flags & TALLOC_FLAG_POOLMEM ) ) {
+                /*
+                 *Paranoia
+                 */
+                if(unlikely(parent == NULL)) {
+                    return -1;
+                }
+                return _talloc_pool_release(parent, tc, NULL);
+            } else {
+                free(tc);
+            }
+        }
+    }
+    return 0;
+}
 
 /* 
    internal talloc_free call
@@ -562,6 +829,7 @@ static void *_talloc_steal_internal(const void *new_ctx, const void *ptr);
 static inline int _talloc_free_internal(void *ptr, const char *location)
 {
 	struct talloc_chunk *tc;
+	struct talloc_chunk *parent = NULL;
 
 	if (unlikely(ptr == NULL)) {
 		return -1;
@@ -604,6 +872,15 @@ static inline int _talloc_free_internal(void *ptr, const char *location)
 		tc->destructor = NULL;
 	}
 
+    /*
+     * Get the contained parent chunk only for nested pools.
+     */
+    if( unlikely(!
+                 ((tc->flags & (TALLOC_FLAG_POOL | TALLOC_FLAG_POOLMEM) ) ^ 
+                  (TALLOC_FLAG_POOL | TALLOC_FLAG_POOLMEM)))) {
+        parent = talloc_parent_chunk(TC_PTR_FROM_CHUNK(tc));
+    }
+        
 	if (tc->parent) {
 		_TLIST_REMOVE(tc->parent->child, tc);
 		if (tc->parent->child) {
@@ -647,23 +924,11 @@ static inline int _talloc_free_internal(void *ptr, const char *location)
 
 	if (tc->flags & (TALLOC_FLAG_POOL|TALLOC_FLAG_POOLMEM)) {
 		struct talloc_chunk *pool;
-		unsigned int *pool_object_count;
 
 		pool = (tc->flags & TALLOC_FLAG_POOL)
 			? tc : (struct talloc_chunk *)tc->pool;
 
-		pool_object_count = talloc_pool_objectcount(pool);
-
-		if (*pool_object_count == 0) {
-			talloc_abort("Pool object count zero!");
-			return 0;
-		}
-
-		*pool_object_count -= 1;
-
-		if (*pool_object_count == 0) {
-			free(pool);
-		}
+        return _talloc_pool_release(pool, tc, parent);
 	}
 	else {
 		free(tc);

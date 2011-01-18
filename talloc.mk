@@ -4,10 +4,13 @@ TALLOC_SOLIB = libtalloc.$(SHLIBEXT).$(TALLOC_VERSION)
 TALLOC_SONAME = libtalloc.$(SHLIBEXT).$(TALLOC_VERSION_MAJOR)
 TALLOC_STLIB = libtalloc.a
 
-all:: $(TALLOC_STLIB) $(TALLOC_SOLIB) testsuite
+all:: $(TALLOC_STLIB) $(TALLOC_SOLIB) testsuite talloc_test
 
 testsuite:: $(LIBOBJ) testsuite.o testsuite_main.o
 	$(CC) $(CFLAGS) -o testsuite testsuite.o testsuite_main.o $(LIBOBJ) $(LIBS)
+
+talloc_test:: $(LIBOBJ) talloc_test.o
+	$(CC) $(CFLAGS) -o talloc_test talloc_test.o $(LIBOBJ) $(LIBS)
 
 $(TALLOC_STLIB): $(LIBOBJ)
 	ar -rv $@ $(LIBOBJ)
@@ -29,13 +32,14 @@ install:: all
 doc:: talloc.3 talloc.3.html
 
 clean::
-	rm -f *~ $(LIBOBJ) $(TALLOC_SOLIB) $(TALLOC_STLIB) testsuite testsuite.o testsuite_main.o *.gc?? talloc.3 talloc.3.html
+	rm -f *~ $(LIBOBJ) $(TALLOC_SOLIB) $(TALLOC_STLIB) talloc_test talloc_test.o testsuite testsuite.o testsuite_main.o *.gc?? talloc.3 talloc.3.html
 	rm -fr abi
 	rm -f talloc.exports.sort talloc.exports.check talloc.exports.check.sort
 	rm -f talloc.signatures.sort talloc.signatures.check talloc.signatures.check.sort
 
-test:: testsuite
+test:: testsuite talloc_test
 	./testsuite
+	./talloc_test
 
 abi_checks::
 	@echo ABI checks:
