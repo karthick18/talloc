@@ -1,0 +1,22 @@
+talloc is a hierarchical, reference counted memory pool system with destructors. It is the core memory allocator used in Samba.
+
+Its an extremely cool wrapper over malloc that allows you to organize your memory contexts in a more seamless way without bothering about freeing embedded pointer contexts within nested structs which can easily lead to leaks. With talloc you can easily embed all allocations into a parent context and just free the parent context which would automatically free the embedded nested pointers.
+
+The jumpstart with talloc, first refer to some sample code usage at:
+http://talloc.samba.org/talloc/doc/html/index.html
+
+You can also refer to the torture tests of talloc in testsuite.c for api usage. 
+
+Additionally I have a simpler usage example that covers some important talloc usage in: talloc_test.c
+
+It also has sample usage examples to my newly added talloc static pool apis: talloc_pool_cache, talloc_cache.
+The existing talloc pools didn't have reclaims and were variable in size and just supported allocating from the pool. Reclaims were just decrementing the usage count of the pools but still won't allow the same pool to be used if the pool allocations exhausted the pool.
+
+I introduced a simple talloc static pool which creates a static pool of fixed object sizes for an object cache.
+This enables one to create a talloc pool cache and then just use the context pointer to allocate fixed size objects from the pre-created static cache. Because its a fixed-size pool cache, it supports free as well. Allocations and free from the static pool add a bitmap overhead to keep track of objects allocations and frees. But the existing talloc pools header overhead remains unchanged.
+
+I strongly recommend malloc users to try and consider talloc as it makes pointer maintenane a breeze when structs get deeply nested increasing the potential for memory leaks. Also one can easily share a pointer across modules by reference counting the pointer. 
+
+But these benefits do come at a cost over malloc as talloc is measured to be 4% slower over malloc. But the benefits make the trade-offs worthwhile whenever acceptable. You could easily use talloc to manage segments of your code while falling back to the faster mallocs for the heavily used fast-path or performance centric code.
+
+-Karthick (a.r.karthick@gmail.com)
