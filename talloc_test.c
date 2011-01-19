@@ -1,73 +1,15 @@
+/*
+ * Simple talloc usage. for guys trying to wrap their mallocs with the spicy talloc topping.
+ * To compile : 
+ * make talloc_test
+ */
 #include <stdio.h>
 #include <string.h>
 #include <assert.h>
 #include <talloc.h>
+#include "list.h"
 
 static int pool_destructor(void *p)  { printf("Inside [%s] for object at [%p]\n", __FUNCTION__, p); return 0;}
-
-struct list_head
-{
-    struct list_head *next, *prev;
-};
-#define LIST_INIT(list) \
-    struct list_head list = { .next = &(list), .prev = &(list) }
-
-#define list_init(list) do { (list)->next = (list), (list)->prev = (list); } while(0)
-
-#define LIST_ADD(element, before, after) do {   \
-    (element)->prev = (before);                 \
-    (element)->next = (after);                  \
-    (before)->next = (element);                 \
-    (after)->prev = (element);                  \
-}while(0)
-
-#define LIST_DEL(before, after) do {            \
-    (before)->next = (after);                   \
-    (after)->prev =  (before);                  \
-}while(0)
-
-#define LIST_EMPTY(list) ( (list)->next == (list) )
-
-#define list_entry(element, cast, field) \
-    (cast*) ( (unsigned char *)element - (unsigned long)&((cast*)0)->field )
-
-#define list_for_each(iter, list) \
-    for(iter = (list)->next ; iter != (list); iter = (iter)->next)
-
-static __inline__ void list_add(struct list_head *element, struct list_head *head)
-{
-    if(!element->next && !element->prev)
-    {
-        struct list_head *after = head->next;
-        LIST_ADD(element, head, after);
-    }
-}
-
-static __inline__ void list_add_tail(struct list_head *element, struct list_head *head)
-{
-    if(!element->next && !element->prev)
-    {
-        struct list_head *before = head->prev;
-        LIST_ADD(element, before, head);
-    }
-}
-
-static __inline__ void list_del(struct list_head *element)
-{
-    if(element->next && element->prev)
-    {
-        struct list_head *before = element->prev;
-        struct list_head *after = element->next;
-        LIST_DEL(before, after);
-        element->next = element->prev = NULL;
-    }
-}
-
-static __inline__ void list_del_init(struct list_head *element)
-{
-    list_del(element);
-    list_init(element);
-}
 
 struct test_list
 {
@@ -84,11 +26,12 @@ static void test2(void *parent)
     talloc_set_name(t, "test_list");
     t->s = talloc_strdup(t, "foo");
     assert(t->s);
-    talloc_free(t);
+    talloc_free(t); /* will automatically free dup'ed t->s */
 }
 
 /*
- * Steal the child list elements into the new list
+ * Just steal the child list elements into the new list. 
+ * But after the free here, the child elements hanging off the last parent list shouldn't be used.
  */
 static void test5(void *parent, struct list_head *src_list)
 {
@@ -102,9 +45,10 @@ static void test5(void *parent, struct list_head *src_list)
     list_for_each(iter, src_list)
     {
         struct test_list *s = list_entry(iter, struct test_list, list);
-        assert(talloc_steal(new_list, s) == s);
+        assert(talloc_steal(new_list, s) == s); /* move the list element contexts */
     }
-    talloc_free(new_parent);
+    list_init(src_list); /* empty the list */
+    talloc_free(new_parent); /* will automatically free all the list elements stolen from src_list */
 }
 
 static void test4(struct list_head *src_list)
@@ -119,7 +63,6 @@ static void test4(struct list_head *src_list)
         d->s = talloc_reference(s, s->s);
         assert(d->s);
         assert(talloc_reference_count(s->s) == 1);
-        assert(talloc_unlink(s, s->s) == 0);
         list_add(&d->list, &dst_list);
     }
     while(!LIST_EMPTY(&dst_list))
@@ -127,7 +70,8 @@ static void test4(struct list_head *src_list)
         struct test_list *d = list_entry(dst_list.next, struct test_list, list);
         list_del(&d->list);
         printf("Duped list [%s], name [%s]\n", talloc_get_name(d), d->s);
-        assert(talloc_unlink(talloc_find_parent_byname(d, d->s), d->s) == 0);
+        /* will drop the reference for the pointer grabbed from the parent */
+        assert(talloc_unlink(talloc_find_parent_byname(d, d->s), d->s) == 0); 
     }
 }
 
@@ -147,16 +91,19 @@ static void test3(void *parent)
         list_add_tail(&l->list, &test_list);
     }
     test4(&test_list);
+    test5(list_parent, &test_list); /*move elements off to a new parent and free*/
     while(!LIST_EMPTY(&test_list))
     {
         struct test_list *l = list_entry(test_list.next, struct test_list, list);
         list_del(&l->list);
         printf("list name [%s], dup [%s]\n", talloc_get_name(l), l->s);
     }
-    test5(list_parent, &test_list); /*move elements off to a new parent and free*/
     talloc_free(list_parent); 
 }
 
+/*
+ * Test the newly added talloc static object cache.
+ */
 static void test_cache(void)
 {
     void *cache;
@@ -222,11 +169,15 @@ int main()
     register int i;
     {
         talloc_set_log_stderr();
-        talloc_enable_leak_report_full();
+        talloc_enable_leak_report_full(); /* this would register an atexit for a leak report */
     }
     void *parent = talloc_new(NULL);
     void *poolfoo = talloc_pool(parent, sizeof(struct foo) * 1024);
-    void *poolbar = talloc_pool(poolfoo, sizeof(struct bar) * 100); /*subpool of foo*/
+    /*
+     *subpool or nested pool of foo. Without my talloc changes, it would crash default talloc 2.0.1 
+     * on a subpool free of poolbar 
+     */
+    void *poolbar = talloc_pool(poolfoo, sizeof(struct bar) * 100); 
     void *arr[100];
     assert(parent);
     assert(poolfoo);
@@ -249,7 +200,7 @@ int main()
     }
     for(i = 0; i < 100; ++i)
         assert(talloc_free(arr[i]) == 0);
-    assert(talloc_free(poolbar) == 0);
+    assert(talloc_free(poolbar) == 0); 
     assert(talloc_free(poolfoo) == 0);
     test2(parent);
     test3(parent);
@@ -258,11 +209,3 @@ int main()
     return 0;
 }
 
-
-/*
- * Local variables:
- * c-file-style: "linux"
- * compile-command: "gcc -Wall -g -o talloc_test talloc_test.c -ltalloc"
- * tab-width: 4
- * End:
- */
