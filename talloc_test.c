@@ -2,6 +2,9 @@
  * Simple talloc usage. for guys trying to wrap their mallocs with the spicy talloc topping.
  * To compile : 
  * make talloc_test
+ * 
+ * Additionally refer to the talloc README at:
+ * https://github.com/karthick18/talloc
  */
 #include <stdio.h>
 #include <string.h>
